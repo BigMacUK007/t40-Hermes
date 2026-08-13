@@ -46,6 +46,8 @@ RECORDING_RE = re.compile(
 )
 CHAT_RE = re.compile(r"/chats/(\d+)")
 TAG_RE = re.compile(r"<[^>]+>")
+BR_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+MARKDOWN_LINK_RE = re.compile(r"!?\[([^\]]+)\]\(([^)]+)\)")
 SPACE_RE = re.compile(r"\s+")
 
 
@@ -75,6 +77,26 @@ def _plain_text(value: Any) -> str:
     text = html.unescape(str(value or ""))
     text = TAG_RE.sub(" ", text)
     return SPACE_RE.sub(" ", html.unescape(text)).strip()
+
+
+def _ping_plain_text(value: Any) -> str:
+    """Render model Markdown as one natural Basecamp Ping paragraph.
+
+    Structured multi-paragraph chat lines are displayed by Basecamp with a
+    long-message rail. Direct Pings should read like chat, so strip lightweight
+    Markdown and flatten whitespace before sending.
+    """
+    text = html.unescape(str(value or ""))
+    text = BR_RE.sub("\n", text)
+    text = MARKDOWN_LINK_RE.sub(lambda match: f"{match.group(1)} ({match.group(2)})", text)
+    text = re.sub(r"```(?:[A-Za-z0-9_+-]+)?\s*|```", "", text)
+    text = re.sub(r"(?m)^\s{0,3}(?:[-*+] |\d+[.)] )", "", text)
+    text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)
+    text = re.sub(r"(\*\*|__|~~|`)", "", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", text)
+    text = re.sub(r"(?<!_)_([^_\n]+)_(?!_)", r"\1", text)
+    text = TAG_RE.sub(" ", text)
+    return SPACE_RE.sub(" ", text).strip()
 
 
 def _url_id(pattern: re.Pattern[str], value: Any) -> Optional[str]:
@@ -672,6 +694,7 @@ class BasecampAdapter(BasePlatformAdapter):
             return SendResult(success=False, error=f"Basecamp project not approved: {bucket_id}")
         try:
             if kind in {"ping", "chat"}:
+                outbound_content = _ping_plain_text(content) if kind == "ping" else content
                 payload = await self._cli_json(
                     "--account",
                     self._account_id,
@@ -679,7 +702,7 @@ class BasecampAdapter(BasePlatformAdapter):
                     "post",
                     f"/buckets/{bucket_id}/chats/{recording_id}/lines.json",
                     "--data",
-                    json.dumps({"content": content}),
+                    json.dumps({"content": outbound_content}),
                     "--json",
                 )
             else:

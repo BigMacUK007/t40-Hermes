@@ -319,11 +319,28 @@ def test_poll_marks_processed_reading_ids_with_cli_command(tmp_path):
     )
 
 
+def test_ping_plain_text_removes_markdown_and_structured_breaks():
+    content = (
+        "At the moment I can access:\n\n"
+        "**Account:** T40 Digital  \n"
+        "**Project:** T40 HQ\n\n"
+        "- Message Board\n"
+        "- [Docs](https://example.com)"
+    )
+    assert _basecamp._ping_plain_text(content) == (
+        "At the moment I can access: Account: T40 Digital Project: T40 HQ "
+        "Message Board Docs (https://example.com)"
+    )
+
+
 def test_send_ping_uses_circle_bucket_and_transcript(tmp_path):
     adapter = _adapter(tmp_path)
     adapter._cli_json = AsyncMock(return_value={"ok": True, "data": {"id": 55}})
     result = _run(
-        adapter.send(f"ping:{CIRCLE_ID}:{PING_TRANSCRIPT_ID}", "Hello from Hermes")
+        adapter.send(
+            f"ping:{CIRCLE_ID}:{PING_TRANSCRIPT_ID}",
+            "**Hello**\n\n- from Hermes",
+        )
     )
     assert result.success is True
     call = adapter._cli_json.await_args
