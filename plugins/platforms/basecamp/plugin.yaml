@@ -1,0 +1,30 @@
+name: basecamp-platform
+label: Basecamp
+kind: platform
+version: 1.0.0
+description: >
+  Basecamp event adapter for Hermes Agent. Polls the authenticated Basecamp
+  CLI profile for direct Pings, verified mentions and assignments, then posts
+  replies as the same Basecamp person.
+author: T40
+optional_env:
+  - name: BASECAMP_CLI_PROFILE
+    description: "Authenticated Basecamp CLI profile (default: hermes)"
+    prompt: "Basecamp CLI profile"
+    password: false
+  - name: BASECAMP_ACCOUNT_ID
+    description: "Basecamp account ID"
+    prompt: "Basecamp account ID"
+    password: false
+  - name: BASECAMP_PROJECT_IDS
+    description: "Comma-separated approved Basecamp project IDs"
+    prompt: "Approved project IDs"
+    password: false
+  - name: BASECAMP_PERSON_ID
+    description: "Basecamp person ID used by Hermes for loop prevention"
+    prompt: "Hermes Basecamp person ID"
+    password: false
+  - name: BASECAMP_ALLOWED_USERS
+    description: "Comma-separated Basecamp person IDs allowed to trigger Hermes"
+    prompt: "Allowed Basecamp person IDs"
+    password: false
