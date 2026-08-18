@@ -324,6 +324,113 @@ def _wait_for_pid_exit(pid: int, timeout: float) -> bool:
         _time.sleep(0.5)
 
 
+# --- Wedged-gateway detection + bounded escalation (#81642) -----------------
+#
+# A gateway whose asyncio loop is stalled (e.g. an in-loop compression pass,
+# #72707) cannot process SIGTERM/SIGUSR1 shutdown: the drain wait then burns
+# the full drain budget (180s by default), warns "still running after 180.0s
+# — restart may fail", and `hermes update` can deadlock behind it.  The loop
+# publishes a liveness signal precisely for this case: an asyncio task
+# rewrites ``state/gateway.heartbeat`` every 30s (#66892), so a frozen loop
+# stops refreshing the file while a busy-but-alive loop keeps refreshing it.
+#
+# ``probe_gateway_loop_liveness`` reads that signal (a local stat + JSON read,
+# instant — far inside the 10s query tier of the subprocess timeout doc) and
+# classifies the gateway BEFORE any drain wait begins:
+#
+# - ``alive``   — heartbeat is fresh: the loop is dispatching (possibly busy).
+#                 Callers must take the normal graceful-drain path, which
+#                 honours the in-flight cron drain floor (#86684).
+# - ``wedged``  — heartbeat belongs to this PID but has gone stale well past
+#                 several missed beats: the loop is provably dead.  Draining
+#                 is pointless (nothing can run the drain), so callers may
+#                 escalate immediately via ``_escalate_wedged_gateway``.
+# - ``unknown`` — no heartbeat / unreadable / PID mismatch (older gateway,
+#                 still starting up, stale file from a previous process).
+#                 Treated like ``alive``: never escalate on ambiguity.
+#
+# The distinction matters: only a *provably dead* loop may bypass the cron
+# drain floor.  A merely busy gateway still answers the probe (fresh file)
+# and keeps its full drain budget.
+
+GATEWAY_LOOP_ALIVE = "alive"
+GATEWAY_LOOP_WEDGED = "wedged"
+GATEWAY_LOOP_UNKNOWN = "unknown"
+
+# Heartbeat cadence is 30s (gateway.shutdown_watchdog.DEFAULT_HEARTBEAT_INTERVAL_S).
+# Three missed beats is decisive without false-positiving on one slow write.
+DEFAULT_LOOP_LIVENESS_STALE_AFTER_S = 90.0
+
+
+def probe_gateway_loop_liveness(
+    pid: int,
+    *,
+    stale_after: float = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S,
+    home: Path | None = None,
+) -> str:
+    """Classify a gateway PID's event loop as alive / wedged / unknown.
+
+    Reads the loop-liveness heartbeat file the gateway rewrites every 30s
+    while its loop is dispatching.  Never raises; any ambiguity (missing
+    file, unreadable JSON, PID mismatch) returns ``GATEWAY_LOOP_UNKNOWN``
+    so callers default to the safe graceful-drain path.
+    """
+    try:
+        stale_budget = max(float(stale_after), 0.0)
+    except (TypeError, ValueError):
+        stale_budget = DEFAULT_LOOP_LIVENESS_STALE_AFTER_S
+    try:
+        from gateway.shutdown_watchdog import get_loop_heartbeat_path
+
+        path = get_loop_heartbeat_path(home)
+        mtime = path.stat().st_mtime
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        heartbeat_pid = int(payload.get("pid", 0))
+    except Exception:
+        return GATEWAY_LOOP_UNKNOWN
+    if heartbeat_pid <= 0 or int(pid) <= 0 or heartbeat_pid != int(pid):
+        # No heartbeat for THIS process — old gateway version, still starting
+        # up, or a stale file from a previous PID.  Not evidence of a wedge.
+        return GATEWAY_LOOP_UNKNOWN
+    age = time.time() - mtime
+    if age > stale_budget:
+        return GATEWAY_LOOP_WEDGED
+    return GATEWAY_LOOP_ALIVE
+
+
+def _escalate_wedged_gateway(
+    pid: int,
+    *,
+    term_grace: float = 5.0,
+    kill_wait: float = 5.0,
+) -> bool:
+    """Bounded stop for a gateway whose loop is provably dead (#81642).
+
+    SIGTERM first (the process may still have a live signal handler thread
+    even with a dead loop), a short grace, then SIGKILL.  Total worst case is
+    ``term_grace + kill_wait`` (~10s by default) — never the 180s drain
+    budget, which only makes sense when a loop exists to run the drain.
+
+    Callers MUST have classified the gateway as ``GATEWAY_LOOP_WEDGED``
+    before calling this: escalating a merely busy gateway would bypass the
+    in-flight cron drain floor (#86684) and SIGKILL live work.
+
+    Returns True once the PID has left the process table.
+    """
+    try:
+        terminate_pid(pid, force=False)
+    except (ProcessLookupError, PermissionError, OSError):
+        return _wait_for_pid_exit(pid, 1.0)
+    if _wait_for_pid_exit(pid, max(float(term_grace), 0.0)):
+        return True
+    try:
+        terminate_pid(pid, force=True)
+        print(f"⚠ Gateway PID {pid} unresponsive to SIGTERM; sent SIGKILL")
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    return _wait_for_pid_exit(pid, max(float(kill_wait), 0.0))
+
+
 def _get_ancestor_pids() -> set[int]:
     """Return the set of PIDs in the current process's ancestor chain.
 
@@ -422,35 +529,35 @@ def _scan_gateway_pids(
             # Prefer wmic when present (fast, stable output format).  On
             # modern Windows 11 / Win 10 late builds, wmic has been
             # removed as part of the WMIC deprecation — fall back to
-            # PowerShell's Get-CimInstance.  Any OSError here (FileNotFoundError
-            # on missing wmic) trips the fallback.
-            # Hide the console window: this scan runs inside the windowless
-            # pythonw.exe gateway/desktop backend, so a bare wmic/powershell
-            # spawn would flash a conhost window on every watchdog probe.
-            from hermes_cli._subprocess_compat import windows_hide_flags
+            # PowerShell's Get-CimInstance.  A spawn failure or timeout
+            # (result is None) trips the fallback.
+            # The scans go through ``bounded_probe_run`` — NOT plain
+            # ``subprocess.run(timeout=...)`` — because on Windows ``run()``'s
+            # post-timeout cleanup joins the pipe reader threads unbounded; a
+            # descendant (conhost.exe) holding duplicated pipe handles then
+            # wedges the caller forever. ``hermes update`` hung exactly there
+            # on slow-WMI machines where the full Win32_Process scan exceeds
+            # its budget (#87134).
+            # bounded_probe_run also hides the console window: this scan runs
+            # inside the windowless pythonw.exe gateway/desktop backend, so a
+            # bare wmic/powershell spawn would flash a conhost window on every
+            # watchdog probe.
+            from hermes_cli._subprocess_compat import bounded_probe_run
 
-            _no_window = {"creationflags": windows_hide_flags()}
             wmic_path = shutil.which("wmic")
             result = None
             if wmic_path is not None:
-                try:
-                    result = subprocess.run(
-                        [
-                            wmic_path,
-                            "process",
-                            "get",
-                            "ProcessId,CommandLine",
-                            "/FORMAT:LIST",
-                        ],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore",
-                        timeout=10,
-                        **_no_window,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
-                    result = None
+                result = bounded_probe_run(
+                    [
+                        wmic_path,
+                        "process",
+                        "get",
+                        "ProcessId,CommandLine",
+                        "/FORMAT:LIST",
+                    ],
+                    timeout=10,
+                    errors="ignore",
+                )
             if result is None or result.returncode != 0 or not (result.stdout or ""):
                 # Fallback: PowerShell Get-CimInstance, emit LIST-style output
                 # so the downstream parser below doesn't need to branch.
@@ -465,17 +572,12 @@ def _scan_gateway_pids(
                     "  '' "
                     "}"
                 )
-                try:
-                    result = subprocess.run(
-                        [powershell, "-NoProfile", "-Command", ps_cmd],
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="ignore",
-                        timeout=15,
-                        **_no_window,
-                    )
-                except (OSError, subprocess.TimeoutExpired):
+                result = bounded_probe_run(
+                    [powershell, "-NoProfile", "-Command", ps_cmd],
+                    timeout=15,
+                    errors="ignore",
+                )
+                if result is None:
                     return []
             if result.returncode != 0 or result.stdout is None:
                 return []
@@ -1598,6 +1700,27 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     except Exception:
         return False
 
+    # Windows Task Scheduler is a supervisor too — and the most reliable
+    # signal is the task's own state, not a parent-chain walk. A Scheduled
+    # Task gateway whose conhost/VBS bootstrap has already exited is
+    # invisible to `_reaper_candidate_is_supervisor_owned` (the parent
+    # chain breaks before services.exe, fail-open), yet it is alive and
+    # supervised. After that launcher exits the task is typically Ready,
+    # not Running — treating only Running as supervised still kills the
+    # detached gateway on every desktop serve start (#86098, #87001).
+    if is_windows():
+        try:
+            # The install-time task name is profile-aware (Hermes_Gateway /
+            # Hermes_Gateway_<profile>) — never hardcode it, or the guard is
+            # dormant on every standard `hermes gateway install` deployment.
+            from hermes_cli.gateway_windows import get_task_name
+
+            _task_name = get_task_name()
+        except Exception:
+            _task_name = "Hermes_Gateway"
+        if _windows_scheduled_task_supervises(_task_name):
+            return False
+
     from gateway.status import _pid_exists, write_planned_stop_marker
 
     own = {os.getpid()}
@@ -1830,6 +1953,78 @@ def is_windows() -> bool:
     return sys.platform == "win32"
 
 
+# Task Scheduler states that mean "this profile still has an official
+# supervisor". Ready is the steady state after the VBS/cmd launcher
+# exits and leaves the detached gateway running (#87001). Queued is a
+# rare in-between. Disabled / MISSING are not supervisors.
+_WINDOWS_TASK_SUPERVISOR_STATES = frozenset({"Running", "Ready", "Queued"})
+
+
+def _windows_scheduled_task_state(task_name: str) -> str | None:
+    """Return the English ``Get-ScheduledTask`` State, or None on failure.
+
+    Implemented with PowerShell instead of ``schtasks`` because the latter
+    localizes its output (a Chinese Windows prints ``状态: 正在运行``, not
+    ``Status: Running``) and emits the local codepage, which ``subprocess``
+    with ``encoding="utf-8"`` silently mangles. The ``State`` property is
+    an English enum value (``Running`` / ``Ready`` / ``Disabled``), stable
+    across locales.
+    """
+    if not is_windows():
+        return None
+    try:
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if powershell is None:
+            return None
+        ps_cmd = (
+            f"$t = Get-ScheduledTask -TaskName '{task_name}' "
+            "-ErrorAction SilentlyContinue; if ($t) { $t.State } else { 'MISSING' }"
+        )
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-Command", ps_cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        state = (result.stdout or "").strip()
+        return state or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def _windows_scheduled_task_running(task_name: str) -> bool:
+    """Return True when a Windows scheduled task with ``task_name`` is Running.
+
+    Narrow helper kept for callers that need the in-flight state. The
+    orphan-reaper uses ``_windows_scheduled_task_supervises`` instead —
+    Ready is the normal post-launch state for a detached gateway.
+    """
+    return _windows_scheduled_task_state(task_name) == "Running"
+
+
+def _windows_scheduled_task_supervises(task_name: str) -> bool:
+    """Return True when Task Scheduler still owns this profile's gateway.
+
+    Used to treat Task Scheduler as a gateway supervisor on Windows: the
+    orphan-reap sweep must not kill a gateway that a scheduled task
+    launched and left detached. After the bootstrap exits the task is
+    Ready, not Running; a Running-only check still writes the planned-stop
+    marker, the gateway exits cleanly with code 0, and the scheduler never
+    restarts it — silently killing A2A/messaging on every desktop-app
+    launch (#86098, #87001).
+
+    Best-effort: any failure (missing task, powershell unavailable, timeout)
+    returns False so the caller falls back to pidfile / parent-chain
+    exclusions.
+    """
+    state = _windows_scheduled_task_state(task_name)
+    return state in _WINDOWS_TASK_SUPERVISOR_STATES
+
+
 def _windows_gateway_should_absorb_console_controls() -> bool:
     """Return True for detached Windows gateway runs that should ignore Ctrl+C.
 
@@ -1849,6 +2044,32 @@ def _windows_gateway_should_absorb_console_controls() -> bool:
         return not bool(sys.stdin and sys.stdin.isatty())
     except (ValueError, OSError):
         return True
+
+
+def _windows_console_window_attached() -> bool | None:
+    """Return whether Windows assigned this process a console window."""
+    if not is_windows():
+        return None
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.kernel32.GetConsoleWindow())  # type: ignore[attr-defined]
+    except (OSError, AttributeError):
+        return None
+
+
+def _windows_gateway_breakaway_state() -> bool | None:
+    """Consume private spawn metadata without guessing for older launchers."""
+    if not is_windows():
+        return None
+    from hermes_cli._subprocess_compat import _WINDOWS_GATEWAY_BREAKAWAY_ENV
+
+    value = os.environ.pop(_WINDOWS_GATEWAY_BREAKAWAY_ENV, None)
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return None
 
 
 # =============================================================================
@@ -1992,16 +2213,48 @@ def _user_systemd_private_socket_path() -> Path:
     return Path(xdg) / "systemd" / "private"
 
 
+def _path_exists_safe(path: Path) -> bool:
+    """``Path.exists()`` that treats an inaccessible path as absent.
+
+    ``Path.exists()`` only swallows a subset of ``OSError`` (ENOENT/ENOTDIR/
+    EBADF/ELOOP); ``EACCES`` still propagates. When ``XDG_RUNTIME_DIR`` leaks
+    from another user — the classic ``su``/``sudo -u`` from a root shell case,
+    where ``/run/user/0`` is ``0700 root:root`` — stat-ing a socket underneath
+    it raises ``PermissionError`` that escapes the systemd preflight as a raw
+    traceback (#86558). An unreadable path is, for our purposes, not reachable.
+    """
+    try:
+        return path.exists()
+    except OSError:  # e.g. EACCES on another user's runtime dir
+        return False
+
+
+def _runtime_dir_is_ours(runtime_dir: str) -> bool:
+    """True when *runtime_dir* exists and is owned by the current uid.
+
+    A leaked ``XDG_RUNTIME_DIR`` belonging to another user must not be trusted:
+    its sockets are unreadable (``EACCES``) and its bus is not ours to drive.
+    """
+    try:
+        return Path(runtime_dir).stat().st_uid == os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
+    except OSError:
+        return False
+
+
 def _user_systemd_socket_ready() -> bool:
     """Return True when user-scope systemd has a reachable control socket.
 
     Some distros expose only the per-user systemd private socket even when the
     D-Bus session bus socket is absent. ``systemctl --user`` can still work in
     that configuration, so preflight checks must treat either socket as valid.
+
+    An inaccessible socket path (e.g. a foreign ``XDG_RUNTIME_DIR`` inherited
+    across ``su``) is treated as not-ready rather than crashing, so the caller
+    falls through to the documented ``UserSystemdUnavailableError`` path.
     """
     return (
-        _user_dbus_socket_path().exists()
-        or _user_systemd_private_socket_path().exists()
+        _path_exists_safe(_user_dbus_socket_path())
+        or _path_exists_safe(_user_systemd_private_socket_path())
     )
 
 
@@ -2013,17 +2266,23 @@ def _ensure_user_systemd_env() -> None:
     ``systemctl --user`` fails with "Failed to connect to bus: No medium found".
     We detect the standard socket path and set the vars so all subsequent
     subprocess calls inherit them.
+
+    An ``XDG_RUNTIME_DIR`` that leaked from another user (``su``/``sudo -u``
+    from root, where the env still points at ``/run/user/0``) is dropped in
+    favour of our own ``/run/user/{uid}`` so ``systemctl --user`` targets the
+    right instance instead of an unreadable foreign socket (#86558).
     """
     uid = os.getuid()  # windows-footgun: ok — POSIX systemd helper, never invoked on Windows
-    if "XDG_RUNTIME_DIR" not in os.environ:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg or not _runtime_dir_is_ours(xdg):
         runtime_dir = f"/run/user/{uid}"
-        if Path(runtime_dir).exists():
+        if _runtime_dir_is_ours(runtime_dir):
             os.environ["XDG_RUNTIME_DIR"] = runtime_dir
 
     if "DBUS_SESSION_BUS_ADDRESS" not in os.environ:
         xdg_runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{uid}")
         bus_path = Path(xdg_runtime) / "bus"
-        if bus_path.exists():
+        if _path_exists_safe(bus_path):
             os.environ["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus_path}"
 
 
@@ -3002,9 +3261,13 @@ def _append_node_dir_for_service(
 
     PATH lookup remains the fallback rung for installs with no managed Node.
     """
-    from hermes_constants import iter_hermes_node_dirs
+    from hermes_constants import (
+        hermes_managed_node_tree_present,
+        iter_hermes_node_dirs,
+    )
 
-    for directory in iter_hermes_node_dirs(hermes_root):
+    managed_node_present = hermes_managed_node_tree_present(hermes_root)
+    for directory in iter_hermes_node_dirs(hermes_root) if managed_node_present else ():
         entry = str(directory)
         try:
             present = directory.is_dir()
@@ -3012,6 +3275,12 @@ def _append_node_dir_for_service(
             present = False
         if present and entry not in path_entries:
             path_entries.append(entry)
+
+    # Ambient PATH lookup is a fallback, not an additional rung. Once the
+    # target Hermes home provides managed Node, consulting the invoker's PATH
+    # makes a system unit differ between sudo/root and its service user.
+    if managed_node_present:
+        return
 
     resolved_node = shutil.which("node")
     if not resolved_node:
@@ -3674,6 +3943,23 @@ def systemd_restart(system: bool = False):
     from gateway.status import get_running_pid
 
     pid = get_running_pid() or _systemd_main_pid(system=system)
+    if pid is not None and probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
+        # Health probe says the event loop is provably dead (#81642): SIGUSR1
+        # can never drain it, so the graceful wait below would burn the full
+        # budget. Bounded escalation (SIGTERM grace → SIGKILL, ~10s) then let
+        # systemd relaunch the unit. A busy-but-alive gateway (fresh
+        # heartbeat) never takes this path — its in-flight work, including
+        # the #86684 cron drain floor, keeps the full graceful budget.
+        print(
+            f"⚠ Gateway PID {pid} event loop is unresponsive — "
+            "skipping graceful drain and forcing a bounded stop..."
+        )
+        _escalate_wedged_gateway(pid)
+        svc = get_service_name()
+        _run_systemctl(["reset-failed", svc], system=system, check=False, timeout=30)
+        _run_systemctl(["restart", svc], system=system, check=False, timeout=90)
+        _wait_for_systemd_service_restart(system=system, previous_pid=pid)
+        return
     if pid is not None:
         scope_label = _service_scope_label(system).capitalize()
         svc = get_service_name()
@@ -4202,8 +4488,22 @@ def _gateway_run_command() -> list[str]:
     return cmd
 
 
-def _timestamped_stderr_gateway_command(error_log: Path) -> list[str]:
-    """Wrap gateway run so raw stderr lines are timestamped before file write."""
+def _timestamped_stderr_gateway_command(
+    error_log: Path,
+    *,
+    external_supervisor: bool = False,
+) -> list[str]:
+    """Wrap gateway run so raw stderr lines are timestamped before file write.
+
+    ``external_supervisor=True`` is for launchd ProgramArguments only: the
+    inner ``gateway run`` must carry ``--external-supervisor`` so
+    ``hermes update`` sees the flag on the live grandchild argv and hands
+    the process back to launchd instead of starting a detached watcher
+    (#86893 / #87005). The detached nohup fallback stays unmarked.
+    """
+    inner = _gateway_run_command()
+    if external_supervisor and "--external-supervisor" not in inner:
+        inner = [*inner, "--external-supervisor"]
     return [
         get_python_path(),
         "-m",
@@ -4211,7 +4511,7 @@ def _timestamped_stderr_gateway_command(error_log: Path) -> list[str]:
         "--error-log",
         str(error_log),
         "--",
-        *_gateway_run_command(),
+        *inner,
     ]
 
 
@@ -4309,7 +4609,9 @@ def generate_launchd_plist() -> str:
     # timestamps to raw stderr lines before they land in gateway.error.log.
     prog_args = [
         f"<string>{part}</string>"
-        for part in _timestamped_stderr_gateway_command(err_path)
+        for part in _timestamped_stderr_gateway_command(
+            err_path, external_supervisor=True
+        )
     ]
     prog_args_xml = "\n        ".join(prog_args)
 
@@ -4826,6 +5128,20 @@ def launchd_restart():
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
+        if pid is not None and probe_gateway_loop_liveness(pid) == GATEWAY_LOOP_WEDGED:
+            # Health probe says the event loop is provably dead (#81642):
+            # the gateway cannot process a graceful shutdown, so waiting the
+            # full drain budget only stalls the restart (and `hermes update`
+            # behind it) for 180s. Bounded escalation instead: SIGTERM grace
+            # → SIGKILL → proceed, ~10s worst case. Never taken for a
+            # busy-but-alive gateway — a fresh heartbeat keeps the drain path
+            # (and the #86684 cron drain floor) fully intact.
+            print(
+                f"⚠ Gateway PID {pid} event loop is unresponsive — "
+                "skipping drain and forcing a bounded stop..."
+            )
+            _escalate_wedged_gateway(pid)
+            pid = None
         if pid is not None:
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway
@@ -5245,6 +5561,12 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         _stdin_is_tty = bool(sys.stdin and sys.stdin.isatty())
     except (ValueError, OSError):
         _stdin_is_tty = False
+    _console_window_attached = _windows_console_window_attached()
+    _gateway_detached = (
+        os.getenv("HERMES_GATEWAY_DETACHED", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
+    _breakaway = _windows_gateway_breakaway_state()
     _absorb_windows_console_controls = _windows_gateway_should_absorb_console_controls()
     if _absorb_windows_console_controls:
         try:
@@ -5347,6 +5669,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         replace=replace,
         argv=sys.argv,
         stdin_is_tty=_stdin_is_tty,
+        console_window_attached=_console_window_attached,
+        detached=_gateway_detached,
+        breakaway=_breakaway,
         absorb_windows_console_controls=_absorb_windows_console_controls,
     )
 

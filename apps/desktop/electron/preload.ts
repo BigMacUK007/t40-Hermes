@@ -4,9 +4,15 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
+  getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  // Registry-scoped fresh WS URL: { connectionId, profile } → result shape of
+  // getGatewayWsUrl, minted against that connection's backend.
+  getGatewayWsUrlFor: payload => ipcRenderer.invoke('hermes:gateway:ws-url-for', payload),
+  // Union agent roster across every registered connection.
+  getAgentRoster: () => ipcRenderer.invoke('hermes:agents:roster'),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
@@ -131,7 +137,18 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     save: payload => ipcRenderer.invoke('hermes:connections:save', payload),
     remove: id => ipcRenderer.invoke('hermes:connections:remove', id),
     setPrimary: id => ipcRenderer.invoke('hermes:connections:set-primary', id),
-    test: id => ipcRenderer.invoke('hermes:connections:test', id)
+    test: id => ipcRenderer.invoke('hermes:connections:test', id),
+    // Fan out `hermes update` to every eligible registered connection.
+    updateAll: () => ipcRenderer.invoke('hermes:connections:update-all'),
+    // Registry lifecycle push (main → renderer): a connection was removed or
+    // materially edited, so secondaries scoped to it must be disposed (and,
+    // for edits, re-dialed at the new target).
+    onChanged: callback => {
+      const listener = (_event, payload) => callback(payload)
+      ipcRenderer.on('hermes:connections:changed', listener)
+
+      return () => ipcRenderer.removeListener('hermes:connections:changed', listener)
+    }
   },
   sshConfigHosts: () => ipcRenderer.invoke('hermes:ssh-config:hosts'),
   sshResolveHost: host => ipcRenderer.invoke('hermes:ssh-config:resolve', host),
@@ -279,6 +296,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:close-preview-requested', listener)
 
     return () => ipcRenderer.removeListener('hermes:close-preview-requested', listener)
+  },
+  onPreviewNav: callback => {
+    const listener = (_event, command) => callback(command)
+    ipcRenderer.on('hermes:preview-nav', listener)
+
+    return () => ipcRenderer.removeListener('hermes:preview-nav', listener)
   },
   onOpenFolderRequested: callback => {
     const listener = () => callback()
