@@ -528,6 +528,31 @@ class BasecampAdapter(BasePlatformAdapter):
                 recording_id=recording_id,
             )
 
+        # Basecamp puts verified mentions on messages, to-dos, cards and other
+        # recordings in the Inbox section. The app URL points to the parent
+        # recording, which is where a reply must be posted.
+        if reading_type == "mention":
+            recording_id = _url_id(RECORDING_RE, app_url)
+            if not recording_id:
+                return None
+            text = _plain_text(reading.get("content_excerpt") or reading.get("title"))
+            if not text:
+                return None
+            return self._build_event(
+                target=f"recording:{bucket_id}:{recording_id}",
+                chat_name=str(reading.get("bucket_name") or "Basecamp mention"),
+                chat_type="group",
+                creator=creator,
+                text=text,
+                message_id=reading_id,
+                timestamp=timestamp,
+                raw=reading,
+                event_key=f"mention:{_reading_key(reading)}",
+                trigger="mention",
+                bucket_id=bucket_id,
+                recording_id=recording_id,
+            )
+
         if section in {"chats", "mentions"}:
             transcript_id = _url_id(CHAT_RE, app_url)
             if not transcript_id:

@@ -78,6 +78,25 @@ def _mention_reading():
     }
 
 
+def _recording_mention_reading():
+    return {
+        "id": 4948728985,
+        "type": "Mention",
+        "section": "inbox",
+        "app_url": (
+            f"https://app.basecamp.com/{ACCOUNT_ID}/buckets/{PROJECT_ID}"
+            "/messages/10230129645#__recording_10230143491"
+        ),
+        "bucket_name": "T40 HQ",
+        "title": "@mentioned you in: Re: Hermes Daily Session Recap",
+        "content_excerpt": "Hello testing if you respond Hermes",
+        "created_at": "2026-08-23T23:12:22.095Z",
+        "unread_at": "2026-08-23T23:12:22.093Z",
+        "creator": _creator(),
+        "readable_sgid": "recording-mention-readable",
+    }
+
+
 def _assignment_reading():
     return {
         "id": 4927122919,
@@ -203,6 +222,15 @@ def test_structured_chat_mention_builds_chat_target(tmp_path):
     event = _run(adapter._event_from_reading(_mention_reading()))
     assert event is not None
     assert event.source.chat_id == f"chat:{PROJECT_ID}:{TRANSCRIPT_ID}"
+    assert event.metadata["basecamp_trigger"] == "mention"
+
+
+def test_verified_recording_mention_builds_parent_recording_target(tmp_path):
+    adapter = _adapter(tmp_path)
+    event = _run(adapter._event_from_reading(_recording_mention_reading()))
+    assert event is not None
+    assert event.source.chat_id == f"recording:{PROJECT_ID}:10230129645"
+    assert event.text == "Hello testing if you respond Hermes"
     assert event.metadata["basecamp_trigger"] == "mention"
 
 
