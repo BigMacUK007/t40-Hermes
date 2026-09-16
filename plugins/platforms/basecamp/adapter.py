@@ -2,8 +2,9 @@
 
 The adapter uses the official ``basecamp`` CLI with a named authenticated
 profile. It polls Basecamp's Hey! readings and assignment report, emits only
-explicit Pings, verified mentions and new assignments, persists cursor state,
-and sends replies through the same Basecamp identity.
+explicit Pings, verified mentions, new assignments and opted-in comments on
+subscribed work threads, persists cursor state, and sends replies through the
+same Basecamp identity.
 
 The initial T40 deployment is deliberately fail-closed: approved project IDs,
 Basecamp person IDs and the Hermes person ID must all be configured.
@@ -234,6 +235,9 @@ class BasecampAdapter(BasePlatformAdapter):
         self._state_path = Path(str(extra.get("state_path") or default_state)).expanduser()
         self._mark_read = _bool(extra.get("mark_read"), True)
         self._bootstrap_silently = _bool(extra.get("bootstrap_silently"), True)
+        self._follow_subscribed_comments = _bool(
+            extra.get("follow_subscribed_comments"), False
+        )
         self._poll_task: Optional[asyncio.Task] = None
         self._poll_lock = asyncio.Lock()
         self._state: dict[str, Any] = {
@@ -553,6 +557,35 @@ class BasecampAdapter(BasePlatformAdapter):
                 recording_id=recording_id,
             )
 
+        # Once Hermes is subscribed to a work item, comments on that item are
+        # the Basecamp equivalent of replies in an existing thread. This is
+        # opt-in because broad subscription activity can otherwise be noisy.
+        if (
+            reading_type == "comment"
+            and self._follow_subscribed_comments
+            and reading.get("subscribed") is True
+        ):
+            recording_id = _url_id(RECORDING_RE, app_url)
+            if not recording_id:
+                return None
+            text = _plain_text(reading.get("content_excerpt") or reading.get("title"))
+            if not text:
+                return None
+            return self._build_event(
+                target=f"recording:{bucket_id}:{recording_id}",
+                chat_name=str(reading.get("bucket_name") or "Basecamp thread"),
+                chat_type="group",
+                creator=creator,
+                text=text,
+                message_id=reading_id,
+                timestamp=timestamp,
+                raw=reading,
+                event_key=f"comment:{_reading_key(reading)}",
+                trigger="subscribed_comment",
+                bucket_id=bucket_id,
+                recording_id=recording_id,
+            )
+
         if section in {"chats", "mentions"}:
             transcript_id = _url_id(CHAT_RE, app_url)
             if not transcript_id:
@@ -851,8 +884,9 @@ def register(ctx) -> None:
         allow_update_command=False,
         platform_hint=(
             "You are responding to an explicit Basecamp Ping, verified @Hermes mention, "
-            "or assignment. The adapter posts your final answer back to that exact Basecamp "
-            "Ping, Campfire, or work item as Hermes (Agent). Be concise. Do not create or "
-            "change other Basecamp work unless the request explicitly asks you to."
+            "assignment, or a new comment in a subscribed work thread. The adapter posts "
+            "your final answer back to that exact Basecamp Ping, Campfire, or work item as "
+            "Hermes (Agent). Be concise. Do not create or change other Basecamp work unless "
+            "the request explicitly asks you to."
         ),
     )

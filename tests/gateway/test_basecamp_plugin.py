@@ -97,6 +97,26 @@ def _recording_mention_reading():
     }
 
 
+def _subscribed_comment_reading(subscribed=True):
+    return {
+        "id": 5001760938,
+        "type": "Comment",
+        "section": "inbox",
+        "app_url": (
+            f"https://app.basecamp.com/{ACCOUNT_ID}/buckets/{PROJECT_ID}"
+            "/card_tables/cards/10309036114#__recording_10309096926"
+        ),
+        "bucket_name": "Compleye System",
+        "title": "Re: Decide browser testing for the redesign (GitHub #93)",
+        "content_excerpt": "can you implement this",
+        "created_at": "2026-09-16T10:00:04.108Z",
+        "unread_at": "2026-09-16T10:00:04.107Z",
+        "creator": _creator(),
+        "readable_sgid": "comment-readable",
+        "subscribed": subscribed,
+    }
+
+
 def _assignment_reading():
     return {
         "id": 4927122919,
@@ -232,6 +252,25 @@ def test_verified_recording_mention_builds_parent_recording_target(tmp_path):
     assert event.source.chat_id == f"recording:{PROJECT_ID}:10230129645"
     assert event.text == "Hello testing if you respond Hermes"
     assert event.metadata["basecamp_trigger"] == "mention"
+
+
+def test_subscribed_comment_builds_parent_recording_target_when_enabled(tmp_path):
+    adapter = _adapter(tmp_path, follow_subscribed_comments=True)
+    event = _run(adapter._event_from_reading(_subscribed_comment_reading()))
+    assert event is not None
+    assert event.source.chat_id == f"recording:{PROJECT_ID}:10309036114"
+    assert event.text == "can you implement this"
+    assert event.metadata["basecamp_trigger"] == "subscribed_comment"
+
+
+def test_subscribed_comment_is_dropped_when_following_is_disabled(tmp_path):
+    adapter = _adapter(tmp_path, follow_subscribed_comments=False)
+    assert _run(adapter._event_from_reading(_subscribed_comment_reading())) is None
+
+
+def test_unsubscribed_comment_is_dropped_when_following_is_enabled(tmp_path):
+    adapter = _adapter(tmp_path, follow_subscribed_comments=True)
+    assert _run(adapter._event_from_reading(_subscribed_comment_reading(False))) is None
 
 
 def test_assignment_safety_net_requires_hermes_assignee(tmp_path):
