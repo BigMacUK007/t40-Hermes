@@ -17,12 +17,14 @@ import base64
 from collections import deque
 from datetime import datetime, timezone
 import html
+from html.parser import HTMLParser
 import json
 import logging
 import os
 from pathlib import Path
 import re
 import shutil
+import time
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from gateway.config import Platform, PlatformConfig
@@ -74,10 +76,26 @@ def _bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
+class _TextParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+
+    def handle_data(self, data):
+        self.parts.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        self.parts.append(" ")
+
+
 def _plain_text(value: Any) -> str:
-    text = html.unescape(str(value or ""))
-    text = TAG_RE.sub(" ", text)
-    return SPACE_RE.sub(" ", html.unescape(text)).strip()
+    parser = _TextParser()
+    parser.feed(str(value or ""))
+    parser.close()
+    return SPACE_RE.sub(" ", "".join(parser.parts)).strip()
 
 
 def _ping_plain_text(value: Any) -> str:
@@ -181,7 +199,9 @@ def validate_config(config: PlatformConfig) -> bool:
     return bool(
         (extra.get("account_id") or os.getenv("BASECAMP_ACCOUNT_ID"))
         and (extra.get("person_id") or os.getenv("BASECAMP_PERSON_ID"))
-        and _csv_set(extra.get("project_ids") or os.getenv("BASECAMP_PROJECT_IDS"))
+        and (extra.get("project_scope") == "membership"
+             or _csv_set(extra.get("project_ids") or os.getenv("BASECAMP_PROJECT_IDS")))
+        and _csv_set(extra.get("allowed_users") or os.getenv("BASECAMP_ALLOWED_USERS"))
     )
 
 
@@ -221,6 +241,12 @@ class BasecampAdapter(BasePlatformAdapter):
         self._project_ids = _csv_set(
             extra.get("project_ids") or os.getenv("BASECAMP_PROJECT_IDS")
         )
+        self._membership_scope = extra.get("project_scope") == "membership"
+        if self._membership_scope:
+            self._project_ids = set()  # No trust before the first live lookup.
+        self._project_refresh_interval = max(2.0, float(extra.get("project_refresh_interval", 30)))
+        self._project_refresh_at = 0.0
+        self._project_lock = asyncio.Lock()
         self._allowed_users = _csv_set(
             extra.get("allowed_users") or os.getenv("BASECAMP_ALLOWED_USERS")
         )
@@ -239,13 +265,21 @@ class BasecampAdapter(BasePlatformAdapter):
             extra.get("follow_subscribed_comments"), False
         )
         self._poll_task: Optional[asyncio.Task] = None
+        self._poll_failed_at: Optional[float] = None
+        self._health_alerted = False
+        self._health_alert_attempted_at = 0.0
+        self._health_alert_target = str(extra.get("health_alert_target") or "")
         self._poll_lock = asyncio.Lock()
+        self._cli_lock = asyncio.Lock()
         self._state: dict[str, Any] = {
             "version": 1,
             "bootstrapped": False,
             "seen_readings": [],
             "assignment_ids": [],
             "seen_events": [],
+            "membership_projects": [],
+            "membership_checked_at": None,
+            "project_cutoffs": {},
         }
         self._identity: dict[str, Any] = {}
         self._attachable_sgid = str(extra.get("attachable_sgid") or "")
@@ -264,7 +298,7 @@ class BasecampAdapter(BasePlatformAdapter):
         if not validate_config(self.config):
             self._set_fatal_error(
                 "basecamp_config_invalid",
-                "Basecamp account_id, person_id and project_ids are required",
+                "Basecamp account_id, person_id, allowed_users and project scope are required",
                 retryable=False,
             )
             return False
@@ -275,6 +309,7 @@ class BasecampAdapter(BasePlatformAdapter):
                 await self.poll_once(dispatch=not self._bootstrap_silently)
                 self._state["bootstrapped"] = True
                 self._save_state()
+            self._wire_plugin_handlers()
             self._mark_connected()
             self._poll_task = asyncio.create_task(self._poll_loop())
             logger.info(
@@ -328,39 +363,128 @@ class BasecampAdapter(BasePlatformAdapter):
         self._identity = person
         self._attachable_sgid = self._attachable_sgid or str(person.get("attachable_sgid") or "")
 
-        projects = await self._cli_json(
-            "--account", self._account_id, "projects", "list", "--json"
-        )
-        project_data = _data_from_envelope(projects)
+        await self._refresh_project_access(force=True)
+
+    async def _refresh_project_access(self, *, force: bool = False) -> None:
+        async with self._project_lock:
+            if not force and time.monotonic() - self._project_refresh_at < self._project_refresh_interval:
+                return
+            await self._fetch_project_access()
+
+    async def _fetch_project_access(self) -> None:
+        try:
+            projects = await self._cli_json(
+                "--account", self._account_id, "projects", "list", "--all", "--json"
+            )
+            project_data = _data_from_envelope(projects)
+        except Exception:
+            if self._membership_scope:
+                self._project_ids.clear()
+                self._project_refresh_at = 0.0
+            raise
         if isinstance(project_data, dict):
-            project_data = project_data.get("projects") or project_data.get("items") or []
+            project_data = project_data.get("projects", project_data.get("items"))
+        if not isinstance(project_data, list):
+            if self._membership_scope:
+                self._project_ids.clear()
+                self._project_refresh_at = 0.0
+            raise BasecampCliError("Basecamp project list was malformed; intake paused")
         accessible = {
             str(item.get("id"))
-            for item in (project_data or [])
+            for item in project_data
             if isinstance(item, dict) and item.get("id") is not None
         }
-        missing = self._project_ids - accessible
-        if missing:
-            raise BasecampCliError(
-                f"Basecamp profile lacks approved project access: {','.join(sorted(missing))}"
-            )
+        if self._membership_scope:
+            now = datetime.now(timezone.utc).isoformat()
+            known = set(self._state.get("membership_projects") or [])
+            cutoffs = self._state.get("project_cutoffs") or {}
+            # Keep events arriving between the previous scan and discovery,
+            # but never dispatch pre-enrolment history on a new project's first scan.
+            frontier = self._state.get("membership_checked_at") or now
+            cutoffs = {project: cutoffs.get(project, frontier) for project in accessible}
+            for project in accessible - known:
+                cutoffs[project] = frontier
+            self._state.update(membership_projects=sorted(accessible),
+                               membership_checked_at=now, project_cutoffs=cutoffs)
+            self._save_state()
+            if accessible != self._project_ids:
+                logger.info("[basecamp] Membership projects=%s", ",".join(sorted(accessible)))
+            self._project_ids = accessible
+        else:
+            missing = self._project_ids - accessible
+            if missing:
+                raise BasecampCliError(
+                    f"Basecamp profile lacks approved project access: {','.join(sorted(missing))}"
+                )
+        self._project_refresh_at = time.monotonic()
 
     async def _poll_loop(self) -> None:
         backoff = self._poll_interval
         while self._running:
             try:
                 await self.poll_once(dispatch=True)
+                await self._record_poll_recovery()
                 backoff = self._poll_interval
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 logger.warning("[basecamp] Poll failed: %s", exc, exc_info=True)
+                await self._record_poll_failure()
                 backoff = min(max(self._poll_interval, backoff * 2), 120.0)
             await asyncio.sleep(backoff)
+
+    async def _record_poll_failure(self) -> None:
+        now = time.monotonic()
+        if self._poll_failed_at is None:
+            self._poll_failed_at = now
+        self._write_runtime_status_safe(
+            "basecamp_poll", platform_state="degraded",
+            error_code="basecamp_poll_failed", error_message="Basecamp intake is retrying; no events consumed on failed fetch.",
+        )
+        if (now - self._poll_failed_at >= 120 and not self._health_alerted
+                and now - self._health_alert_attempted_at >= 120):
+            self._health_alert_attempted_at = now
+            self._health_alerted = await self._send_health_alert(
+                "Basecamp listener alert: Hermes has been unable to poll Basecamp for at least two minutes. "
+                "Mentions and assignments may be delayed. Automatic retries are running."
+            )
+
+    async def _record_poll_recovery(self) -> None:
+        if self._poll_failed_at is None:
+            return
+        if self._health_alerted:
+            await self._send_health_alert("Basecamp listener recovered: polling has resumed.")
+        self._poll_failed_at = None
+        self._health_alerted = False
+        self._health_alert_attempted_at = 0.0
+        self._write_runtime_status_safe("basecamp_poll", platform_state="connected", error_code=None, error_message=None)
+
+    async def _send_health_alert(self, message: str) -> bool:
+        # Independent transport: a Basecamp auth outage must not hide its own alert.
+        match = re.fullmatch(r"telegram:(-?\d+)", self._health_alert_target)
+        if not match:
+            return False
+        try:
+            from gateway.config import load_gateway_config
+            from gateway.platform_registry import platform_registry
+            entry = platform_registry.get("telegram")
+            config = load_gateway_config().platforms.get(Platform("telegram"))
+            if not entry or not entry.standalone_sender_fn or not config or not config.enabled:
+                return False
+            result = await entry.standalone_sender_fn(config, match.group(1), message)
+            success = result.get("success", False) if isinstance(result, dict) else getattr(result, "success", False)
+            if not success:
+                logger.warning("[basecamp] Independent health alert delivery failed")
+            return bool(success)
+        except Exception:
+            logger.warning("[basecamp] Independent health alert delivery failed", exc_info=True)
+            return False
 
     async def poll_once(self, *, dispatch: bool = True) -> int:
         """Poll readings and assignments once; return dispatched event count."""
         async with self._poll_lock:
+            if self._membership_scope:
+                await self._refresh_project_access()
             reading_payload, assignment_payload = await asyncio.gather(
                 self._cli_json(
                     "--account", self._account_id, "api", "get", "/my/readings.json", "--quiet"
@@ -510,6 +634,8 @@ class BasecampAdapter(BasePlatformAdapter):
 
         if not bucket_id or bucket_id not in self._project_ids:
             return None
+        if not self._project_event_current(bucket_id, reading.get("unread_at") or reading.get("created_at")):
+            return None
 
         if reading_type == "assignment" or str(reading.get("title") or "").lower().startswith("assigned you"):
             recording_id = _url_id(RECORDING_RE, app_url)
@@ -535,7 +661,7 @@ class BasecampAdapter(BasePlatformAdapter):
         # Basecamp puts verified mentions on messages, to-dos, cards and other
         # recordings in the Inbox section. The app URL points to the parent
         # recording, which is where a reply must be posted.
-        if reading_type == "mention":
+        if reading_type == "mention" and not _url_id(CHAT_RE, app_url):
             recording_id = _url_id(RECORDING_RE, app_url)
             if not recording_id:
                 return None
@@ -586,7 +712,7 @@ class BasecampAdapter(BasePlatformAdapter):
                 recording_id=recording_id,
             )
 
-        if section in {"chats", "mentions"}:
+        if section in {"chats", "mentions"} or reading_type == "mention":
             transcript_id = _url_id(CHAT_RE, app_url)
             if not transcript_id:
                 return None
@@ -620,6 +746,21 @@ class BasecampAdapter(BasePlatformAdapter):
     async def _resolve_mention_line(
         self, reading: dict, bucket_id: str, transcript_id: str
     ) -> Optional[dict]:
+        # Inbox Mention URLs identify the exact Campfire line after '@'.
+        # Resolve that line, not the newest matching text elsewhere in chat.
+        line_match = re.search(r"/chats/\d+@(\d+)(?:$|[?#])", str(reading.get("app_url") or ""))
+        if str(reading.get("type") or "").lower() == "mention" and line_match:
+            payload = await self._cli_json(
+                "--account", self._account_id, "api", "get",
+                f"/buckets/{bucket_id}/chats/{transcript_id}/lines/{line_match.group(1)}.json",
+                "--quiet",
+            )
+            line = _data_from_envelope(payload)
+            if not isinstance(line, dict) or str(line.get("id")) != line_match.group(1):
+                return None
+            if str((line.get("creator") or {}).get("id")) != str((reading.get("creator") or {}).get("id")):
+                return None
+            return line
         payload = await self._cli_json(
             "--account",
             self._account_id,
@@ -665,6 +806,8 @@ class BasecampAdapter(BasePlatformAdapter):
         bucket_id = str(bucket.get("id") or _url_id(BUCKET_RE, assignment.get("app_url")) or "")
         recording_id = str(assignment.get("id") or "")
         if not bucket_id or bucket_id not in self._project_ids or not recording_id:
+            return None
+        if not self._project_event_current(bucket_id, assignment.get("updated_at") or assignment.get("created_at")):
             return None
         creator = assignment.get("creator") or {}
         creator_id = str(creator.get("id") or "")
@@ -734,6 +877,17 @@ class BasecampAdapter(BasePlatformAdapter):
             },
         )
 
+    def _project_event_current(self, project_id: str, timestamp: Any) -> bool:
+        if not self._membership_scope:
+            return True
+        cutoff = (self._state.get("project_cutoffs") or {}).get(project_id)
+        if not cutoff or not timestamp:
+            return False
+        try:
+            return datetime.fromisoformat(str(timestamp).replace("Z", "+00:00")) >= datetime.fromisoformat(cutoff)
+        except (TypeError, ValueError):
+            return False
+
     def _user_allowed(self, person_id: str) -> bool:
         return bool(self._allowed_users and str(person_id) in self._allowed_users)
 
@@ -748,6 +902,11 @@ class BasecampAdapter(BasePlatformAdapter):
         if not match:
             return SendResult(success=False, error=f"Invalid Basecamp target: {chat_id}")
         kind, bucket_id, recording_id = match.groups()
+        if kind != "ping" and self._membership_scope:
+            try:
+                await self._refresh_project_access()
+            except Exception:
+                return SendResult(success=False, error="Basecamp membership lookup failed; send paused", retryable=True)
         if kind != "ping" and bucket_id not in self._project_ids:
             return SendResult(success=False, error=f"Basecamp project not approved: {bucket_id}")
         try:
@@ -801,6 +960,22 @@ class BasecampAdapter(BasePlatformAdapter):
         }
 
     async def _cli_json(self, *args: str, stdin: Optional[str] = None) -> Any:
+        # Each CLI process probes the shared credential store. Avoid overlapping
+        # our own polls/sends, and retry a transient missing-credential READ only.
+        read_only = stdin is None and (
+            ("api" in args and args[args.index("api") + 1:args.index("api") + 2] == ("get",))
+            or ("api" not in args and any(verb in args for verb in ("me", "list", "show", "messages")))
+        )
+        async with self._cli_lock:
+            try:
+                return await self._cli_json_once(*args, stdin=stdin)
+            except BasecampCliError as exc:
+                if not read_only or "credentials not found for profile:" not in str(exc):
+                    raise
+                await asyncio.sleep(0.5)
+                return await self._cli_json_once(*args, stdin=stdin)
+
+    async def _cli_json_once(self, *args: str, stdin: Optional[str] = None) -> Any:
         command = [self._binary, "--profile", self._profile, *map(str, args)]
         process = await asyncio.create_subprocess_exec(
             *command,

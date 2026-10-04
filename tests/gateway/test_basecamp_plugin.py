@@ -146,6 +146,129 @@ def _assignment(todo_id="10201071109", creator_id=BEN_ID, project_id=PROJECT_ID)
     }
 
 
+def test_membership_discovery_tracks_additions_removals_without_restart(tmp_path):
+    adapter = _adapter(tmp_path, project_scope="membership", project_ids=[])
+    adapter._cli_json = AsyncMock(side_effect=[
+        [{"id": int(PROJECT_ID)}],
+        [{"id": int(PROJECT_ID)}, {"id": 48914011}],
+        [{"id": 48914011}],
+    ])
+    _run(adapter._refresh_project_access(force=True))
+    assert adapter._project_ids == {PROJECT_ID}
+    _run(adapter._refresh_project_access(force=True))
+    assert adapter._project_ids == {PROJECT_ID, "48914011"}
+    _run(adapter._refresh_project_access(force=True))
+    assert adapter._project_ids == {"48914011"}
+    result = _run(adapter.send(f"recording:{PROJECT_ID}:123", "No"))
+    assert result.success is False
+    assert _basecamp.validate_config(adapter.config)
+    assert "--all" in adapter._cli_json.await_args_list[0].args
+
+
+def test_new_membership_suppresses_old_work_but_accepts_fresh_request(tmp_path):
+    adapter = _adapter(tmp_path, project_scope="membership", project_ids=[])
+    adapter._cli_json = AsyncMock(return_value=[{"id": int(PROJECT_ID)}])
+    _run(adapter._refresh_project_access(force=True))
+    assert _run(adapter._event_from_reading(_recording_mention_reading())) is None
+    assert adapter._event_from_assignment(_assignment()) is None
+    reading = _recording_mention_reading()
+    reading["unread_at"] = "2099-01-01T00:00:00Z"
+    assert _run(adapter._event_from_reading(reading)) is not None
+    other = _adapter(tmp_path, project_scope="membership", project_ids=[])
+    other._load_state()
+    other._cli_json = AsyncMock(return_value=[{"id": int(PROJECT_ID)}])
+    _run(other._refresh_project_access(force=True))
+    assert other._state["project_cutoffs"] == adapter._state["project_cutoffs"]
+
+
+def test_membership_lookup_failure_clears_scope_and_does_not_consume_events(tmp_path):
+    adapter = _adapter(tmp_path, project_scope="membership", project_ids=[])
+    adapter._cli_json = AsyncMock(return_value=[{"id": int(PROJECT_ID)}])
+    _run(adapter._refresh_project_access(force=True))
+    adapter._project_refresh_at = 0
+    adapter._cli_json = AsyncMock(return_value={"ok": False, "error": "auth unavailable"})
+    try:
+        _run(adapter.poll_once())
+    except _basecamp.BasecampCliError:
+        pass
+    else:
+        raise AssertionError("intake must pause")
+    assert adapter._project_ids == set()
+    assert adapter._state["seen_readings"] == []
+
+
+def test_membership_addition_accepts_request_arriving_between_scans(tmp_path):
+    adapter = _adapter(tmp_path, project_scope="membership", project_ids=[])
+    adapter._state.update(membership_projects=[], membership_checked_at="2026-10-03T22:20:00+00:00")
+    adapter._cli_json = AsyncMock(return_value=[{"id": int(PROJECT_ID)}])
+    _run(adapter._refresh_project_access(force=True))
+    reading = _recording_mention_reading()
+    reading["unread_at"] = "2026-10-03T22:27:26Z"
+    assert _run(adapter._event_from_reading(reading)) is not None
+    reading["creator"] = _creator("999", "Unknown")
+    assert _run(adapter._event_from_reading(reading)) is None
+    reading["creator"] = _creator(PERSON_ID, "Hermes")
+    assert _run(adapter._event_from_reading(reading)) is None
+    reading["creator"] = _creator()
+    reading["unread_at"] = "2026-10-03T22:19:59Z"
+    assert _run(adapter._event_from_reading(reading)) is None
+
+
+def test_poll_failure_sets_degraded_health_and_alerts_once_then_recovers(tmp_path):
+    adapter = _adapter(tmp_path)
+    adapter._write_runtime_status_safe = MagicMock()
+    adapter._send_health_alert = AsyncMock(return_value=True)
+    adapter._poll_failed_at = _basecamp.time.monotonic() - 130
+    _run(adapter._record_poll_failure())
+    _run(adapter._record_poll_failure())
+    adapter._send_health_alert.assert_awaited_once()
+    assert adapter._write_runtime_status_safe.call_args.kwargs["platform_state"] == "degraded"
+    _run(adapter._record_poll_recovery())
+    assert adapter._poll_failed_at is None
+    assert adapter._write_runtime_status_safe.call_args.kwargs["platform_state"] == "connected"
+
+
+def test_plain_text_ignores_html_encoded_mention_attributes():
+    content = "<p><bc-attachment content='&lt;bc-mention class=\"person\"&gt;Hermes&lt;/bc-mention&gt;'><figure><figcaption>Hermes</figcaption></figure></bc-attachment> please reply &amp; check</p>"
+    assert _basecamp._plain_text(content) == "Hermes please reply & check"
+
+
+def test_cli_retries_missing_credentials_only_for_reads(tmp_path):
+    adapter = _adapter(tmp_path)
+    missing = _basecamp.BasecampCliError("Not authenticated for profile:hermes: credentials not found for profile:hermes")
+    adapter._cli_json_once = AsyncMock(side_effect=[missing, {"unreads": []}])
+    result = _run(adapter._cli_json("api", "get", "/my/readings.json", "--quiet"))
+    assert result == {"unreads": []}
+    assert adapter._cli_json_once.await_count == 2
+    adapter._cli_json_once = AsyncMock(side_effect=missing)
+    try:
+        _run(adapter._cli_json("api", "post", "/somewhere", "--json"))
+    except _basecamp.BasecampCliError:
+        pass
+    else:
+        raise AssertionError("write must not be retried")
+    assert adapter._cli_json_once.await_count == 1
+
+
+def test_chat_lookup_failure_does_not_advance_reading_cursor(tmp_path):
+    adapter = _adapter(tmp_path)
+    reading = _mention_reading()
+    async def cli(*args, **kwargs):
+        if "/my/readings.json" in args:
+            return {"unreads": [reading]}
+        if "/my/assignments.json" in args:
+            return []
+        raise _basecamp.BasecampCliError("temporary chat fetch failure")
+    adapter._cli_json = cli
+    try:
+        _run(adapter.poll_once())
+    except _basecamp.BasecampCliError:
+        pass
+    else:
+        raise AssertionError("lookup should fail")
+    assert _basecamp._reading_key(reading) not in adapter._state["seen_readings"]
+
+
 def test_plugin_registration():
     ctx = MagicMock()
     _basecamp.register(ctx)
@@ -243,6 +366,28 @@ def test_structured_chat_mention_builds_chat_target(tmp_path):
     assert event is not None
     assert event.source.chat_id == f"chat:{PROJECT_ID}:{TRANSCRIPT_ID}"
     assert event.metadata["basecamp_trigger"] == "mention"
+
+
+def test_inbox_chat_mention_routes_to_exact_chat_and_dedupes_line(tmp_path):
+    adapter = _adapter(tmp_path)
+    reading = _recording_mention_reading()
+    reading["app_url"] = (
+        f"https://app.basecamp.com/{ACCOUNT_ID}/buckets/{PROJECT_ID}"
+        f"/chats/{TRANSCRIPT_ID}@10369033426"
+    )
+    reading["content_excerpt"] = "can you progress on this"
+    line = {
+        "id": 10369033426,
+        "creator": _creator(),
+        "content": "can you progress on this",
+        "created_at": reading["unread_at"],
+    }
+    adapter._cli_json = AsyncMock(return_value=line)
+    event = _run(adapter._event_from_reading(reading))
+    assert event is not None
+    assert event.source.chat_id == f"chat:{PROJECT_ID}:{TRANSCRIPT_ID}"
+    assert event.metadata["basecamp_event_key"] == "line:10369033426"
+    assert event.text == "can you progress on this"
 
 
 def test_verified_recording_mention_builds_parent_recording_target(tmp_path):
