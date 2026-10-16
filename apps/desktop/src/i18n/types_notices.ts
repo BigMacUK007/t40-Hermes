@@ -1,5 +1,10 @@
+<<<<<<< HEAD
 // Shell notice strings: the remote-display toast, the butterbar and send-outcome toasts;
 // `Translations` spreads this in.
+=======
+// Shell notice strings: the remote-display toast, the butterbar and the keep-awake offer; `Translations`
+// spreads this in.
+>>>>>>> 518ce272b9 (fix(local): keep long local-model turns alive on laptops)
 export interface NoticeTranslations {
   remoteDisplayBanner: {
     message: (reason: string) => string
@@ -10,6 +15,7 @@ export interface NoticeTranslations {
     legal: { before: string; terms: string; between: string; privacy: string; after: string }
   }
 
+<<<<<<< HEAD
   promptNotices: {
     /** An explicit retry of a send whose identityless (legacy) acknowledgement was lost. */
     legacySendUnconfirmed: string
@@ -33,4 +39,8 @@ export interface SessionCommandNotices {
   queueFailed: string
   countOne: (count: string) => string
   countOther: (count: string) => string
+=======
+  /** Once per computer, after a timed sleep interrupted a turn with keep-awake off. */
+  keepAwakeOffer: { title: string; message: string; action: string }
+>>>>>>> 518ce272b9 (fix(local): keep long local-model turns alive on laptops)
 }

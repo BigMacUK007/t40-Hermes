@@ -82,7 +82,11 @@ export const zhHantOverrides = {
   notifications: zhHantDiagnostics.notifications,
   remoteDisplayBanner: zhHantBoot.remoteDisplayBanner,
   butterbar: zhHantBoot.butterbar,
+<<<<<<< HEAD
   promptNotices: zhHantBoot.promptNotices,
+=======
+  keepAwakeOffer: zhHantBoot.keepAwakeOffer,
+>>>>>>> 518ce272b9 (fix(local): keep long local-model turns alive on laptops)
   billingBlock: zhHantCommon.billingBlock,
   sendDiagnostics: zhHantDiagnostics.sendDiagnostics,
   titlebar: zhHantChrome.titlebar,

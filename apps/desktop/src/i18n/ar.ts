@@ -35,7 +35,11 @@ export const arOverrides = {
   notifications: arDiagnostics.notifications,
   remoteDisplayBanner: arBoot.remoteDisplayBanner,
   butterbar: arBoot.butterbar,
+<<<<<<< HEAD
   promptNotices: arBoot.promptNotices,
+=======
+  keepAwakeOffer: arBoot.keepAwakeOffer,
+>>>>>>> 518ce272b9 (fix(local): keep long local-model turns alive on laptops)
   titlebar: arChrome.titlebar,
   keybinds: arChrome.keybinds,
   language: arSettings.language,

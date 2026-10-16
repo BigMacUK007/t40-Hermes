@@ -1,7 +1,7 @@
 import type { TranslationOverrides } from './define-locale'
 import { frSessionCommands } from './fr_session_commands'
 
-// Shell notices (remote-display toast, butterbar), spread into fr.ts.
+// Shell notices (remote-display toast, butterbar, keep-awake offer), spread into fr.ts.
 export const frNotices = {
   remoteDisplayBanner: {
     message: reason =>
@@ -17,9 +17,19 @@ export const frNotices = {
       after: '.'
     }
   },
+<<<<<<< HEAD
   promptNotices: {
     legacySendUnconfirmed:
       "Ce serveur n'a pas pu confirmer l'envoi précédent de ce message ; il a peut-être déjà été exécuté. Vérifiez la conversation avant de le renvoyer.",
     sessionCommands: frSessionCommands
   }
 } satisfies Pick<TranslationOverrides, 'remoteDisplayBanner' | 'butterbar' | 'promptNotices'>
+=======
+  keepAwakeOffer: {
+    title: 'Votre ordinateur s’est mis en veille pendant que Hermes travaillait',
+    message:
+      'Hermes peut empêcher la mise en veille pendant qu’une tâche s’exécute. L’écran s’éteint toujours, et sur batterie l’ordinateur peut quand même se mettre en veille.',
+    action: 'Empêcher la veille pendant le travail'
+  }
+} satisfies Pick<TranslationOverrides, 'remoteDisplayBanner' | 'butterbar' | 'keepAwakeOffer'>
+>>>>>>> 518ce272b9 (fix(local): keep long local-model turns alive on laptops)
